@@ -1,5 +1,7 @@
 import pandas as pd
 from pathlib import Path
+from xml.etree import ElementTree
+from progress.bar import IncrementalBar
 
 
 def parse_xml_file(filename: Path) -> list:
