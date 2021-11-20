@@ -27,18 +27,9 @@ class FasterRCNN(nn.Module):
             roi_output_size, roi_spatial_scale, backbone_out_channels, representation_dim, num_classes
         )
 
-    def forward(self, input: dict) -> dict:
-        images = self._unpack_input(input)
-        rpn_output = self.rpn({'x': images})
-        features, rois = rpn_output['features'], rpn_output['rois'] # features[N, 512, H, W, 7]; rois[N,]
-
-        if self.training:
-            pass
-
-
+    def forward(self, images):
+        rpn_output = self.rpn(images)
+        features, rois = rpn_output['features'], rpn_output['rois']  # features[N, 512, H, W, 7]; rois[N, ]
 
         fast_rcnn_output = self.fast_rcnn(rpn_output)
         return fast_rcnn_output
-
-    def _unpack_input(self, input: dict):
-        return input['input']

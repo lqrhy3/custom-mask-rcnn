@@ -28,7 +28,7 @@ class FastRCNN(nn.Module):
         self.box_predictor = nn.Linear(representation_dim, 4 * num_classes)
         self.cls_predictor = nn.Linear(representation_dim, num_classes)
 
-    def forward(self, input: dict) -> dict:
+    def forward(self, input: dict):
         features, rois = self._unpack_input(input)
         rois_features = self.roi({'features': features, 'rois': rois})['roi_features']
         features = self.mlp(rois_features)
