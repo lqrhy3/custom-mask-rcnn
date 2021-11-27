@@ -1,8 +1,15 @@
+from typing import Tuple, List, Dict, Optional
+
+import matplotlib.pyplot as plt
 import torch
 from torch import nn
-from torchvision.ops import clip_boxes_to_image, batched_nms, box_iou
+from torchvision.ops import clip_boxes_to_image, nms, batched_nms, box_iou, box_convert, remove_small_boxes
+from torchvision.utils import draw_bounding_boxes
 
-from utils.utils import anchor_transforms_to_boxes, get_cross_boundary_box_idxs
+from utils.utils import anchor_transforms_to_boxes, boxes_to_anchor_transforms, get_cross_boundary_box_idxs
+
+
+Tensor = torch.tensor
 
 
 class SlidingNetwork(nn.Module):
@@ -28,133 +35,226 @@ class SlidingNetwork(nn.Module):
 class RPN(nn.Module):
     def __init__(
             self,
-            backbone: nn.Module,
-            backbone_out_features: int,
+            backbone_out_channels: int,
             anchor_generator,
-            image_size,
-            pre_nms_top_n: int,
-            post_nms_top_n: int,
-            nms_iou_threshold: float
+            image_size: Tuple[int, int],
+            pre_nms_top_n: Optional[Dict[str, int]],
+            proposal_min_size: Optional[float],
+            objectness_prob_threshold: Optional[float],
+            nms_iou_threshold: float,
+            post_nms_top_n: Dict[str, int],
+            nms_iou_pos_threshold: float,
+            nms_iou_neg_threshold: float,
+            rpn_batch_size: int
     ):
         super().__init__()
 
-        self.backbone = backbone
         self.anchor_generator = anchor_generator
         self.image_size = image_size
         self.pre_nms_top_n = pre_nms_top_n
-        self.post_nms_top_n = post_nms_top_n
+        self.proposal_min_size = proposal_min_size
+        self.objectness_prob_threshold = objectness_prob_threshold
         self.nms_iou_threshold = nms_iou_threshold
+        self.post_nms_top_n = post_nms_top_n
+        self.nms_iou_pos_threshold = nms_iou_pos_threshold
+        self.nms_iou_neg_threshold = nms_iou_neg_threshold
+
+        assert rpn_batch_size % 2 == 0
+        self.rpn_batch_size = rpn_batch_size
 
         self.sliding_network = SlidingNetwork(
-            backbone_out_features, len(self.anchors)
+            backbone_out_channels, self.anchor_generator.num_cell_anchors[0]
         )
 
-    def forward(self, x, gt_boxes: list = None, gt_classes: list = None):
-        backbone_features = self.backbone(x)['features']
+        self.cls_criterion = nn.BCEWithLogitsLoss(reduction='mean')
+        self.reg_criterion = nn.SmoothL1Loss(reduction='sum')
+
+
+    def forward(self, backbone_features, gt_boxes: list = None):
 
         anchor_transforms, anchor_objectnesses = self.sliding_network(backbone_features)  # [N, 4 * num_anchors, H, W]
                                                                                           # [N, num_anchors, H, W]
         anchor_transforms = torch.reshape(anchor_transforms, (anchor_transforms.shape[0], 4, -1)).permute((0, 2, 1))
 
         anchors = self.anchor_generator(backbone_features)
-        proposals = anchor_transforms_to_boxes(anchor_transforms, anchors)
+        proposals = anchor_transforms_to_boxes(anchor_transforms.detach(), anchors)
 
-        proposal_objectnesses = torch.reshape(anchor_objectnesses, (anchor_transforms.shape[0], -1))
+        proposal_objectnesses = torch.reshape(anchor_objectnesses.detach().clone(), (anchor_transforms.shape[0], -1))
 
+        proposals = self._filter_proposals(proposals, proposal_objectnesses)
+
+        loss = {}
         if self.training:
             assert gt_boxes is not None
-            proposals, proposal_objectnesses = self._filter_proposals(proposals, proposal_objectnesses, gt_classes)
-            proposals_batched, objectnesses_batched = self._collate_fn(
-                proposals, proposal_objectnesses, gt_boxes
-            )  # TODO: return positive and negative labels
 
-            losses = ...  # compute losses
-            return proposals_batched, objectnesses_batched, losses
+            matched_gt_boxes, labels = self.assign_targets_to_anchors(anchors, gt_boxes)
+            gt_transforms = boxes_to_anchor_transforms(matched_gt_boxes, anchors)
 
-        else:
-            proposals, proposal_objectnesses = clip_boxes_to_image(proposals, self.image_size)
-            proposals = self._filter_proposals(proposals, proposal_objectnesses, gt_classes)
+            anchor_objectnesses = torch.reshape(anchor_objectnesses, (anchor_transforms.shape[0], -1))
 
-            return backbone_features, proposals, proposal_objectnesses
+            anchor_transforms_batched, gt_transforms_batched, objectnesses_bathed, labels_batched = self._collate_fn(
+                anchor_transforms, gt_transforms, anchor_objectnesses, labels
+            )
+            loss = self.compute_loss(
+                anchor_transforms_batched, gt_transforms_batched, objectnesses_bathed, labels_batched
+            )
 
-    def _collate_fn(self, proposals, proposal_objectnesses, gt_boxes: list):
-        """
-        :param proposals: [N, post_nms_top_k, 4] zero padded
-        :param proposal_objectnesses: [N, post_nms_top_k] zero padded
-        :param gt_boxes: [Tensor[G_i, 4], ...]
-        :return [N, 256, 4]
-        """
-        batch_size = proposals.shape[0]
-        batched_proposals = torch.empty((batch_size, 256, 4))
-        batched_objectnesses = torch.empty((batch_size, 256))
+        return proposals, loss
 
-        for i in range(batch_size):
-            proposals_i = proposals[i]
-            proposal_objectnesses_i = proposal_objectnesses[i]
-            gt_boxes_i = gt_boxes[i]
-
-            ious = box_iou(proposals_i, gt_boxes_i)
-            mask = torch.any(ious > 0.7, dim=1)
-            mask = mask | torch.any(ious == torch.max(ious, dim=0)[0], dim=1)
-
-            positive_idxs = mask.nonzero()
-            negative_idxs = (~mask).nonzero()
-
-            num_positive_samples = 128 if positive_idxs.shape[0] >= 128 else positive_idxs.shape[0]
-            num_negative_samples = 128 if num_positive_samples == 128 else 256 - num_positive_samples
-
-            positive_idxs = positive_idxs[torch.randperm(len(positive_idxs))[:num_positive_samples]]
-            negative_idxs = negative_idxs[torch.randperm(len(negative_idxs))[:num_negative_samples]]
-
-            positive_proposals_i = proposals_i[positive_idxs].squeeze(1)
-            positive_objectnesses_i = proposal_objectnesses_i[positive_idxs].squeeze(1)
-            negative_proposals_i = proposals_i[negative_idxs].squeeze(1)
-            negative_objectnesses_i = proposal_objectnesses_i[negative_idxs].squeeze(1)
-
-            batched_proposals[i] = torch.cat([positive_proposals_i, negative_proposals_i])
-            batched_objectnesses[i] = torch.cat([positive_objectnesses_i, negative_objectnesses_i])
-
-        return batched_proposals, batched_objectnesses
-
-    def _filter_proposals(self, proposals, proposal_objectnesses, gt_classes):
+    def _filter_proposals(self, proposals, objectnesses) -> List[Tensor]:
         """
         :param proposals: [N, K, 4]
-        :param proposal_objectnesses: [N, K],
-        :param gt_classes: [Tensor[G_i,], ...]
+        :param objectnesses: [N, K],
         """
         batch_size = proposals.shape[0]
-        proposal_objectnesses = proposal_objectnesses.detach()
 
-        _, orders = torch.sort(proposal_objectnesses, dim=1)
-        output_proposals = torch.zeros((batch_size, self.post_nms_top_n, 4), dtype=proposals.dtype)
-        output_objectnesses = torch.zeros((batch_size, self.post_nms_top_n), dtype=proposal_objectnesses.dtype)
+        proposals = clip_boxes_to_image(proposals, self.image_size)
+
+        objectnesses = objectnesses.detach()
+        objectnesses_prob = torch.sigmoid(objectnesses)
+
+        # select top N pre nms proposals based on objectness_prob
+        if self.pre_nms_top_n is not None:
+            pre_nms_top_n = min(self._pre_nms_top_n(), proposals.shape[1])
+            _, top_n_idxs = torch.topk(objectnesses_prob, pre_nms_top_n, dim=1)
+
+            proposals = proposals[torch.arange(batch_size)[:, None], top_n_idxs]
+            objectnesses_prob = objectnesses_prob[torch.arange(batch_size)[:, None], top_n_idxs]
+
+        filtered_proposals = []
 
         for i in range(batch_size):
-            proposals_i, proposal_objectnesses_i = proposals[i], proposal_objectnesses[i]
-            orders_i = orders[i]
-            gt_classes_i = gt_classes[i]
+            proposals_i, objectnesses_prob_i = proposals[i], objectnesses_prob[i]
 
-            if self.training:
-                cross_boundary_box_idxs = get_cross_boundary_box_idxs(proposals_i, self.image_size)
-                proposals_i = proposals_i[~cross_boundary_box_idxs]
-                proposal_objectnesses_i = proposal_objectnesses_i[~cross_boundary_box_idxs]
-                orders_i = orders_i[~cross_boundary_box_idxs]
+            if self.proposal_min_size is not None:
+                keep = remove_small_boxes(proposals_i, self.proposal_min_size)
+                proposals_i = proposals_i[keep]
+                objectnesses_prob_i = objectnesses_prob_i[keep]
 
-            if self.pre_nms_top_n is not None and self.pre_nms_top_n > 0:
-                orders_i = orders_i[:self.post_nms_top_n]
+            if self.objectness_prob_threshold is not None:
+                keep = torch.where(objectnesses_prob_i >= self.objectness_prob_threshold)[0]
+                proposals_i = proposals_i[keep]
+                objectnesses_prob_i = objectnesses_prob_i[keep]
 
-            proposals_i = proposals_i[orders_i]
-            proposal_objectnesses_i = proposal_objectnesses_i[orders_i]
+            keep = nms(proposals_i, objectnesses_prob_i, self.nms_iou_threshold)
+            if self._post_nms_top_n() > 0:
+                keep = keep[:self._post_nms_top_n()]
 
-            keep_idx = batched_nms(proposals_i, proposal_objectnesses_i, gt_classes_i, self.nms_iou_threshold)
-            if self.post_nms_top_n > 0:
-                keep_idx = keep_idx[:self.post_nms_top_n]
+            proposals_i = proposals_i[keep]
+            objectnesses_prob_i = objectnesses_prob_i[keep]
 
-            proposals_i = proposals_i[keep_idx]
-            proposal_objectnesses_i = proposal_objectnesses_i[keep_idx]
+            filtered_proposals.append(proposals_i)
+        return filtered_proposals
 
-            num_proposal = proposals_i.shape[0]
-            output_proposals[i, :num_proposal, :] = proposals_i
-            output_objectnesses[i, :num_proposal] = proposal_objectnesses_i
+    def match_proposals(self, proposals, gt_boxes):
+        """
+        :param proposals: [K, 4]
+        :param gt_boxes: Tensor[G_i, 4]
+        """
 
-        return output_proposals, output_objectnesses
+        ious = box_iou(proposals, gt_boxes)  # K x G_i
+        matched_vals, matches = ious.max(dim=1)
+
+        below_threshold = matched_vals < self.nms_iou_neg_threshold
+        between_thresholds = (matched_vals >= self.nms_iou_neg_threshold) &\
+                             (matched_vals < self.nms_iou_pos_threshold)
+
+        cross_boundary = get_cross_boundary_box_idxs(proposals, self.image_size)
+
+        matches[below_threshold] = -1
+        matches[between_thresholds] = -2
+        matches[cross_boundary] = -2
+
+        return matches
+
+    def assign_targets_to_anchors(self, anchors, gt_boxes) -> Tuple[List[Tensor], List[Tensor]]:
+        """
+        :param anchors: [N, K, 4]
+        :param gt_boxes: [Tensor[G_i, 4], ...]
+        """
+        batch_size = anchors.shape[0]
+
+        matched_gt_boxes = []
+        labels = []
+
+        for i in range(batch_size):
+            anchors_i = box_convert(anchors[i], 'cxcywh', 'xyxy')
+            gt_boxes_i = gt_boxes[i]
+
+            matches_i = self.match_proposals(anchors_i, gt_boxes_i)
+            matched_gt_boxes_i = gt_boxes_i[matches_i.clamp(min=0)]
+
+            labels_i = matches_i >= 0
+            labels_i = labels_i.to(dtype=torch.float32)
+
+            neg_idxs = matches_i == -1
+            labels_i[neg_idxs] = 0.
+
+            discard_idxs = matches_i == -2
+            labels_i[discard_idxs] = -1.
+
+            matched_gt_boxes.append(matched_gt_boxes_i)
+            labels.append(labels_i)
+
+        return matched_gt_boxes, labels
+
+    def _collate_fn(self, anchor_transforms, gt_transforms, objectnesses, labels) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+        """
+        :param anchor_transforms: [N, K, 4]
+        :param gt_transforms: [N, K, 4]
+        :param labels: List[N, K]
+        """
+        batch_size = anchor_transforms.shape[0]
+
+        anchor_transforms_batched = torch.empty((batch_size, self.rpn_batch_size, 4))
+        gt_transforms_batched = torch.empty((batch_size, self.rpn_batch_size, 4))
+        objectnesses_batched = torch.empty((batch_size, self.rpn_batch_size))
+        labels_batched = torch.empty((batch_size, self.rpn_batch_size))
+
+        for i in range(batch_size):
+            anchor_transforms_i = anchor_transforms[i]
+            gt_transforms_i = gt_transforms[i]
+            objectnesses_i = objectnesses[i]
+            labels_i = labels[i]
+
+            pos_idxs_i = torch.where(labels_i > 0)[0]
+            neg_idxs_i = torch.where(labels_i == 0)[0]
+
+            num_pos = self.rpn_batch_size // 2 if len(pos_idxs_i) >= self.rpn_batch_size // 2 else len(pos_idxs_i)
+            num_neg = self.rpn_batch_size - num_pos
+            pos_idxs_i = pos_idxs_i[torch.randperm(len(pos_idxs_i))[:num_pos]]
+            neg_idxs_i = neg_idxs_i[torch.randperm(len(neg_idxs_i))[:num_neg]]
+
+            anchor_transforms_batched[i] = torch.cat(
+                [anchor_transforms_i[pos_idxs_i], anchor_transforms_i[neg_idxs_i]], dim=0
+            )
+
+            gt_transforms_batched[i] = torch.cat(
+                [gt_transforms_i[pos_idxs_i], gt_transforms_i[neg_idxs_i]], dim=0
+            )
+
+            objectnesses_batched[i] = torch.cat([objectnesses_i[pos_idxs_i], objectnesses_i[neg_idxs_i]], dim=0)
+            labels_batched[i] = torch.cat([labels_i[pos_idxs_i], labels_i[neg_idxs_i]], dim=0)
+
+        return anchor_transforms_batched, gt_transforms_batched, objectnesses_batched, labels_batched
+
+    def compute_loss(self, anchor_transforms, gt_transforms, objectnesses, labels):
+        cls_loss = self.cls_criterion(objectnesses, labels)
+
+        pos_anchor_transforms = anchor_transforms[labels.nonzero()]
+        pos_gt_transforms = gt_transforms[labels.nonzero()]
+        reg_loss = self.reg_criterion(pos_anchor_transforms, pos_gt_transforms) / labels.numel()
+
+        loss = cls_loss + reg_loss
+
+        return {'loss': loss, 'cls_loss': cls_loss.detach(), 'reg_loss': reg_loss.detach()}
+
+    def _pre_nms_top_n(self) -> int:
+        if self.training:
+            return self.pre_nms_top_n['training']
+        return self.pre_nms_top_n['testing']
+
+    def _post_nms_top_n(self) -> int:
+        if self.training:
+            return self.post_nms_top_n['training']
+        return self.post_nms_top_n['testing']

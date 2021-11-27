@@ -1,6 +1,6 @@
 from typing import Tuple
 from torch import nn
-from torchvision.ops import RoIPool as RoIPoolBase, roi_pool
+from torchvision.ops import RoIPool
 
 
 class FastRCNN(nn.Module):
@@ -28,28 +28,19 @@ class FastRCNN(nn.Module):
         self.box_predictor = nn.Linear(representation_dim, 4 * num_classes)
         self.cls_predictor = nn.Linear(representation_dim, num_classes)
 
-    def forward(self, input: dict):
-        features, rois = self._unpack_input(input)
-        rois_features = self.roi({'features': features, 'rois': rois})['roi_features']
-        features = self.mlp(rois_features)
+    def forward(self, backbone_features, proposals, gt_boxes, gt_classes):
+        rois = self.roi(backbone_features, proposals)
+        features = self.mlp(rois)
 
         box_predictions = self.box_predictor(features)
         cls_predictions = self.cls_predictor(features)
 
-        return {'box_predictions': box_predictions, 'cls_predictions': cls_predictions}
+        loss = {}
+        if self.training:
+            loss = self.compute_loss(box_predictions, cls_predictions, gt_boxes, gt_classes)
 
-    def _unpack_input(self, input: dict):
-        return input['features'], input['rois']
+        return box_predictions, cls_predictions, loss
 
+    def compute_loss(self, box_preds, cls_preds, gt_boxes, gt_classes):
 
-class RoIPool(RoIPoolBase):
-    def __init__(self, output_size: int or Tuple[int, int], spatial_scale: float):
-        super(RoIPool, self).__init__(output_size, spatial_scale)
-
-    def forward(self, input: dict) -> dict:
-        features, boxes = self._unpack_input(input)
-        rois = roi_pool(features, boxes, self.output_size, self.spatial_scale)
-        return {'roi_features': rois}
-
-    def _unpack_input(self, input: dict):
-        return input['features'], input['rois']
+        return {'loss': ...}
