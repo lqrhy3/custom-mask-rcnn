@@ -6,7 +6,7 @@ from torch import nn
 from torchvision.ops import clip_boxes_to_image, nms, batched_nms, box_iou, box_convert, remove_small_boxes
 from torchvision.utils import draw_bounding_boxes
 
-from utils.utils import anchor_transforms_to_boxes, boxes_to_anchor_transforms, get_cross_boundary_box_idxs
+from utils.utils import anchor_transforms_to_boxes, boxes_to_anchor_transforms, get_cross_boundary_box_idxs, ProposalMathcer, BalancedBatchSampler
 
 
 Tensor = torch.tensor
@@ -56,11 +56,13 @@ class RPN(nn.Module):
         self.objectness_prob_threshold = objectness_prob_threshold
         self.nms_iou_threshold = nms_iou_threshold
         self.post_nms_top_n = post_nms_top_n
-        self.nms_iou_pos_threshold = nms_iou_pos_threshold
-        self.nms_iou_neg_threshold = nms_iou_neg_threshold
+
+        self.proposal_matcher = ProposalMathcer(
+            nms_iou_pos_threshold, nms_iou_neg_threshold, image_size
+        )
 
         assert rpn_batch_size % 2 == 0
-        self.rpn_batch_size = rpn_batch_size
+        self.batch_sampler = BalancedBatchSampler(rpn_batch_size)
 
         self.sliding_network = SlidingNetwork(
             backbone_out_channels, self.anchor_generator.num_cell_anchors[0]
@@ -69,9 +71,7 @@ class RPN(nn.Module):
         self.cls_criterion = nn.BCEWithLogitsLoss(reduction='mean')
         self.reg_criterion = nn.SmoothL1Loss(reduction='sum')
 
-
-    def forward(self, backbone_features, gt_boxes: list = None):
-
+    def forward(self, backbone_features: Tensor, gt_boxes: list = None) -> Tuple[List[Tensor], Dict[str, Tensor]]:
         anchor_transforms, anchor_objectnesses = self.sliding_network(backbone_features)  # [N, 4 * num_anchors, H, W]
                                                                                           # [N, num_anchors, H, W]
         anchor_transforms = torch.reshape(anchor_transforms, (anchor_transforms.shape[0], 4, -1)).permute((0, 2, 1))
@@ -101,7 +101,7 @@ class RPN(nn.Module):
 
         return proposals, loss
 
-    def _filter_proposals(self, proposals, objectnesses) -> List[Tensor]:
+    def _filter_proposals(self, proposals: Tensor, objectnesses: Tensor) -> List[Tensor]:
         """
         :param proposals: [N, K, 4]
         :param objectnesses: [N, K],
@@ -146,42 +146,21 @@ class RPN(nn.Module):
             filtered_proposals.append(proposals_i)
         return filtered_proposals
 
-    def match_proposals(self, proposals, gt_boxes):
+    def assign_targets_to_anchors(self, anchors: Tensor, gt_boxes: List[Tensor]) -> Tuple[Tensor, Tensor]:
         """
-        :param proposals: [K, 4]
-        :param gt_boxes: Tensor[G_i, 4]
-        """
-
-        ious = box_iou(proposals, gt_boxes)  # K x G_i
-        matched_vals, matches = ious.max(dim=1)
-
-        below_threshold = matched_vals < self.nms_iou_neg_threshold
-        between_thresholds = (matched_vals >= self.nms_iou_neg_threshold) &\
-                             (matched_vals < self.nms_iou_pos_threshold)
-
-        cross_boundary = get_cross_boundary_box_idxs(proposals, self.image_size)
-
-        matches[below_threshold] = -1
-        matches[between_thresholds] = -2
-        matches[cross_boundary] = -2
-
-        return matches
-
-    def assign_targets_to_anchors(self, anchors, gt_boxes) -> Tuple[List[Tensor], List[Tensor]]:
-        """
-        :param anchors: [N, K, 4]
-        :param gt_boxes: [Tensor[G_i, 4], ...]
+        :param anchors: Tensor[N, K, 4]
+        :param gt_boxes: List[Tensor[G_i, 4], ...]
         """
         batch_size = anchors.shape[0]
 
-        matched_gt_boxes = []
-        labels = []
+        matched_gt_boxes = torch.empty_like(anchors)
+        labels = torch.empty((batch_size, anchors.shape[1]))
 
         for i in range(batch_size):
             anchors_i = box_convert(anchors[i], 'cxcywh', 'xyxy')
             gt_boxes_i = gt_boxes[i]
 
-            matches_i = self.match_proposals(anchors_i, gt_boxes_i)
+            matches_i = self.proposal_matcher(anchors_i, gt_boxes_i)
             matched_gt_boxes_i = gt_boxes_i[matches_i.clamp(min=0)]
 
             labels_i = matches_i >= 0
@@ -193,16 +172,17 @@ class RPN(nn.Module):
             discard_idxs = matches_i == -2
             labels_i[discard_idxs] = -1.
 
-            matched_gt_boxes.append(matched_gt_boxes_i)
-            labels.append(labels_i)
+            matched_gt_boxes[i] = matched_gt_boxes_i
+            labels[i] = labels_i
 
         return matched_gt_boxes, labels
 
-    def _collate_fn(self, anchor_transforms, gt_transforms, objectnesses, labels) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    def _collate_fn(self, anchor_transforms: Tensor, gt_transforms: Tensor, objectnesses: Tensor, labels: Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         """
         :param anchor_transforms: [N, K, 4]
         :param gt_transforms: [N, K, 4]
-        :param labels: List[N, K]
+        :param objectnesses: [N, K]
+        :param labels: [N, K]
         """
         batch_size = anchor_transforms.shape[0]
 
@@ -217,13 +197,7 @@ class RPN(nn.Module):
             objectnesses_i = objectnesses[i]
             labels_i = labels[i]
 
-            pos_idxs_i = torch.where(labels_i > 0)[0]
-            neg_idxs_i = torch.where(labels_i == 0)[0]
-
-            num_pos = self.rpn_batch_size // 2 if len(pos_idxs_i) >= self.rpn_batch_size // 2 else len(pos_idxs_i)
-            num_neg = self.rpn_batch_size - num_pos
-            pos_idxs_i = pos_idxs_i[torch.randperm(len(pos_idxs_i))[:num_pos]]
-            neg_idxs_i = neg_idxs_i[torch.randperm(len(neg_idxs_i))[:num_neg]]
+            pos_idxs_i, neg_idxs_i = self.batch_sampler(labels_i)
 
             anchor_transforms_batched[i] = torch.cat(
                 [anchor_transforms_i[pos_idxs_i], anchor_transforms_i[neg_idxs_i]], dim=0
