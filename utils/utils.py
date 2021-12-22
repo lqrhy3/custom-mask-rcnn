@@ -3,50 +3,61 @@ from typing import Tuple, List, Dict
 import torch
 from torchvision.ops.boxes import box_convert, box_iou
 
-Tensor = torch.tensor
+Tensor = torch.Tensor
 
 
-def anchor_transforms_to_boxes(anchor_transforms, anchors):
+def transforms_to_boxes(transforms: Tensor, anchors: List[Tensor]) -> Tensor:
     """
-    :param anchors: [N, K * num_anchors, 4]
-    :param anchor_transforms: [N, K * num_anchors, 4]
-    :return:
+    :param transforms: Tensor[L x 4 * num_classes] (ctx, cty, tw, th)
+    :param anchors: List[Tensor[L_i, 4] x N] (cxcywh format)
+    :return: (xyxy format)
     """
+    boxes_per_image = [boxes_in_image.shape[0] for boxes_in_image in anchors]
+    num_boxes = sum(boxes_per_image)
+    concat_anchors = torch.cat(anchors, dim=0)
 
-    boxes = torch.empty_like(anchors)
-    boxes[:, :, 0] = anchors[:, :, 2] * anchor_transforms[:, :, 0] + anchors[:, :, 0]
-    boxes[:, :, 1] = anchors[:, :, 3] * anchor_transforms[:, :, 1] + anchors[:, :, 1]
-    boxes[:, :, 2] = torch.exp(anchor_transforms[:, :, 2]) * anchors[:, :, 2]
-    boxes[:, :, 3] = torch.exp(anchor_transforms[:, :, 3]) * anchors[:, :, 3]
+    transforms = transforms.reshape(num_boxes, -1)
 
+    boxes = torch.empty_like(transforms)
+    boxes[:, 0::4] = concat_anchors[:, 0].view(-1, 1) + concat_anchors[:, 2].view(-1, 1) * transforms[:, 0::4]
+    boxes[:, 1::4] = concat_anchors[:, 1].view(-1, 1) + concat_anchors[:, 3].view(-1, 1) * transforms[:, 1::4]
+
+    boxes[:, 2::4] = concat_anchors[:, 2].view(-1, 1) * torch.exp(transforms[:, 2::4])
+    boxes[:, 3::4] = concat_anchors[:, 3].view(-1, 1) * torch.exp(transforms[:, 3::4])
+
+    boxes = boxes.reshape(num_boxes, -1, 4)
     boxes = box_convert(boxes, 'cxcywh', out_fmt='xyxy')
 
     return boxes
 
 
-def boxes_to_anchor_transforms(boxes: Tensor, anchors: Tensor) -> Tensor:
+def boxes_to_transforms(boxes: List[Tensor], anchors: List[Tensor]) -> List[Tensor]:
     """
-    :param boxes: List[Tensor[K * num_anchors, 4], ...]
-    :param anchors: Tensor[N, K * num_anchors, 4]
+    :param boxes: List[Tensor[L_i x 4], N] (xyxy format)
+    :param anchors: List[Tensor[L_i x 4], N] (cxcywh format)
+    :return (ctx, cty, tw, th)
     """
 
-    boxes = torch.stack(boxes, dim=0)
+    boxes_per_image = [boxes_in_image.shape[0] for boxes_in_image in boxes]
+
+    boxes = torch.cat(boxes, dim=0)
     boxes = box_convert(boxes, 'xyxy', out_fmt='cxcywh')
+    anchors = torch.cat(anchors, dim=0)
 
-    tx = (boxes[:, :, 0] - anchors[:, :, 0]) / anchors[:, :, 2]
-    ty = (boxes[:, :, 1] - anchors[:, :, 1]) / anchors[:, :, 3]
+    tx = (boxes[:, 0] - anchors[:, 0]) / anchors[:, 2]
+    ty = (boxes[:, 1] - anchors[:, 1]) / anchors[:, 3]
 
-    tw = torch.log(boxes[:, :, 2] / anchors[:, :, 2])
-    th = torch.log(boxes[:, :, 3] / anchors[:, :, 3])
+    tw = torch.log(boxes[:, 2] / anchors[:, 2])
+    th = torch.log(boxes[:, 3] / anchors[:, 3])
 
-    return torch.stack([tx, ty, tw, th], dim=-1)
+    transforms = torch.stack([tx, ty, tw, th], dim=-1)
+
+    return transforms.split(boxes_per_image)
 
 
-
-
-def get_cross_boundary_box_idxs(boxes, image_size):
+def get_cross_boundary_box_idxs(boxes: Tensor, image_size: Tuple[int, int]):
     """
-    :param boxes: [K, 4]
+    :param boxes: [K, 4] (format xyxy)
     :param image_size: [2,]
     """
     mask = torch.zeros((boxes.shape[0],), dtype=torch.bool, device=boxes.device)
@@ -81,8 +92,8 @@ class ProposalMathcer:
 
     def __call__(self, proposals, gt_boxes):
         """
-        :param proposals: [K, 4]
-        :param gt_boxes: Tensor[G_i, 4]
+        :param proposals: [K, 4] (format xyxy)
+        :param gt_boxes: Tensor[G_i, 4] (format xyxy)
         """
 
         ious = box_iou(proposals, gt_boxes)  # K x G_i
@@ -96,7 +107,10 @@ class ProposalMathcer:
 
         matches[below_threshold] = self.NEG_CONST
         matches[between_thresholds] = self.DISCARD_CONST
-        matches[cross_boundary] = self.DISCARD_CONST
+        # matches[cross_boundary] = self.DISCARD_CONST
+
+
+
 
         return matches
 

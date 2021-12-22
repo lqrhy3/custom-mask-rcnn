@@ -210,6 +210,7 @@ class DefaultAnchorGenerator(nn.Module):
         grid_sizes = [feature_map.shape[-2:] for feature_map in features]
         anchors_over_all_feature_maps = self._grid_anchors(grid_sizes)
         # return [Boxes(x) for x in anchors_over_all_feature_maps]
-        anchors_over_all_feature_maps = torch.stack(anchors_over_all_feature_maps)
-        anchors_over_all_feature_maps = box_convert(anchors_over_all_feature_maps, in_fmt='xyxy', out_fmt='cxcywh')
-        return anchors_over_all_feature_maps
+        # anchors_over_all_feature_maps = torch.stack(anchors_over_all_feature_maps)
+        # anchors_over_all_feature_maps = box_convert(anchors_over_all_feature_maps, in_fmt='xyxy', out_fmt='cxcywh')
+        # return anchors_over_all_feature_maps
+        return [box_convert(x, in_fmt='xyxy', out_fmt='cxcywh') for x in anchors_over_all_feature_maps]

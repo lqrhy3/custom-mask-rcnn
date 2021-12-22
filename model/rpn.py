@@ -6,10 +6,10 @@ from torch import nn
 from torchvision.ops import clip_boxes_to_image, nms, batched_nms, box_iou, box_convert, remove_small_boxes
 from torchvision.utils import draw_bounding_boxes
 
-from utils.utils import anchor_transforms_to_boxes, boxes_to_anchor_transforms, get_cross_boundary_box_idxs, ProposalMathcer, BalancedBatchSampler
+from utils.utils import transforms_to_boxes, boxes_to_transforms, get_cross_boundary_box_idxs, ProposalMathcer, BalancedBatchSampler
 
 
-Tensor = torch.tensor
+Tensor = torch.Tensor
 
 
 class SlidingNetwork(nn.Module):
@@ -62,6 +62,7 @@ class RPN(nn.Module):
         )
 
         assert rpn_batch_size % 2 == 0
+        self.rpn_batch_size = rpn_batch_size
         self.batch_sampler = BalancedBatchSampler(rpn_batch_size)
 
         self.sliding_network = SlidingNetwork(
@@ -76,19 +77,22 @@ class RPN(nn.Module):
                                                                                           # [N, num_anchors, H, W]
         anchor_transforms = torch.reshape(anchor_transforms, (anchor_transforms.shape[0], 4, -1)).permute((0, 2, 1))
 
-        anchors = self.anchor_generator(backbone_features)
-        proposals = anchor_transforms_to_boxes(anchor_transforms.detach(), anchors)
+        anchors = self.anchor_generator(backbone_features)  # List[Tensor[num_anchors x 4] x N]
+
+        num_images = len(anchors)
+        proposals = transforms_to_boxes(anchor_transforms.detach(), anchors)  # Tensor[N x num_anchors x 4]
+        proposals = proposals.view(num_images, -1, 4)
 
         proposal_objectnesses = torch.reshape(anchor_objectnesses.detach().clone(), (anchor_transforms.shape[0], -1))
 
-        proposals = self._filter_proposals(proposals, proposal_objectnesses)
+        proposals = self._filter_proposals(proposals, proposal_objectnesses)  # List[Tensor[L_i x 4] x N]
 
         loss = {}
         if self.training:
             assert gt_boxes is not None
 
-            matched_gt_boxes, labels = self.assign_targets_to_anchors(anchors, gt_boxes)
-            gt_transforms = boxes_to_anchor_transforms(matched_gt_boxes, anchors)
+            matched_gt_boxes, labels = self.assign_targets_to_anchors(anchors, gt_boxes)  # List[Tensor], List[Tensor]
+            gt_transforms = boxes_to_transforms(matched_gt_boxes, anchors)  # List[Tensor]
 
             anchor_objectnesses = torch.reshape(anchor_objectnesses, (anchor_transforms.shape[0], -1))
 
@@ -103,8 +107,8 @@ class RPN(nn.Module):
 
     def _filter_proposals(self, proposals: Tensor, objectnesses: Tensor) -> List[Tensor]:
         """
-        :param proposals: [N, K, 4]
-        :param objectnesses: [N, K],
+        :param proposals: [N, K, 4] (format xyxy)
+        :param objectnesses: [N, K]
         """
         batch_size = proposals.shape[0]
 
@@ -146,15 +150,16 @@ class RPN(nn.Module):
             filtered_proposals.append(proposals_i)
         return filtered_proposals
 
-    def assign_targets_to_anchors(self, anchors: Tensor, gt_boxes: List[Tensor]) -> Tuple[Tensor, Tensor]:
+    def assign_targets_to_anchors(self, anchors: List[Tensor], gt_boxes: List[Tensor]) -> Tuple[List[Tensor], List[Tensor]]:
         """
-        :param anchors: Tensor[N, K, 4]
-        :param gt_boxes: List[Tensor[G_i, 4], ...]
+        :param anchors: Tensor[N, K, 4] (format cxcywh)
+        :param gt_boxes: List[Tensor[G_i, 4], ...] (format xyxy)
+        :return (format xyxy)
         """
-        batch_size = anchors.shape[0]
+        batch_size = len(anchors)
 
-        matched_gt_boxes = torch.empty_like(anchors)
-        labels = torch.empty((batch_size, anchors.shape[1]))
+        matched_gt_boxes = []
+        labels = []
 
         for i in range(batch_size):
             anchors_i = box_convert(anchors[i], 'cxcywh', 'xyxy')
@@ -172,12 +177,18 @@ class RPN(nn.Module):
             discard_idxs = matches_i == -2
             labels_i[discard_idxs] = -1.
 
-            matched_gt_boxes[i] = matched_gt_boxes_i
-            labels[i] = labels_i
+            matched_gt_boxes.append(matched_gt_boxes_i)
+            labels.append(labels_i)
 
         return matched_gt_boxes, labels
 
-    def _collate_fn(self, anchor_transforms: Tensor, gt_transforms: Tensor, objectnesses: Tensor, labels: Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    def _collate_fn(
+            self,
+            anchor_transforms: Tensor,
+            gt_transforms: List[Tensor],
+            objectnesses: Tensor,
+            labels: List[Tensor]
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         """
         :param anchor_transforms: [N, K, 4]
         :param gt_transforms: [N, K, 4]

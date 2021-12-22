@@ -2,12 +2,13 @@ from typing import Tuple, List, Dict
 
 import torch
 from torch import nn
-from torchvision.ops import RoIPool, box_iou
+import torch.nn.functional as F
+from torchvision.ops import RoIPool, box_iou, batched_nms, clip_boxes_to_image, remove_small_boxes
 
-from utils.utils import ProposalMathcer, BalancedBatchSampler, boxes_to_anchor_transforms
+from utils.utils import ProposalMathcer, BalancedBatchSampler, boxes_to_transforms, transforms_to_boxes
 
 
-Tensor = torch.tensor
+Tensor = torch.Tensor
 
 
 class FastRCNN(nn.Module):
@@ -21,11 +22,22 @@ class FastRCNN(nn.Module):
             image_size: Tuple[int, int],
             representation_dim: int,
             num_classes: int,
-            fast_rcnn_batch_size: int
+            fast_rcnn_batch_size: int,
+            inference_score_thresh: float,
+            inference_nms_thresh: float,
+            post_nms_top_n: Dict[str, int],
+            detections_per_img: int
     ):
         super(FastRCNN, self).__init__()
 
+        self.image_size = image_size
+        self.num_classes = num_classes
         self.fast_rcnn_batch_size = fast_rcnn_batch_size
+        self.inference_score_thresh = inference_score_thresh
+        self.inference_nms_thresh = inference_nms_thresh
+        self.post_nms_top_n = post_nms_top_n
+        self.detections_per_img = detections_per_img
+
         self.proposal_matcher = ProposalMathcer(
             nms_iou_pos_threshold, nms_iou_neg_threshold, image_size
         )
@@ -56,38 +68,58 @@ class FastRCNN(nn.Module):
             proposals: List[Tensor],
             gt_boxes: List[Tensor],
             gt_classes: List[Tensor]
-    ) -> Tuple[List[Tensor], Dict[str, Tensor]]:
+    ) -> Tuple[List[Dict[str, Tensor]], Dict[str, Tensor]]:
 
-        rois = self.roi(backbone_features, proposals) # [K, C, h, w]
+        if self.training:
+            matched_gt_boxes, gt_labels = self._assign_targets_to_proposals(proposals, gt_boxes, gt_classes)
+            gt_transforms = boxes_to_transforms(matched_gt_boxes, proposals)
+
+            proposals, gt_transforms, gt_labels = \
+                self._collate_fn(proposals, gt_transforms, gt_labels)
+
+        else:
+            gt_labels, gt_transforms = None, None
+
+        rois = self.roi(backbone_features, proposals)  # [K, C, h, w]
         features = self.mlp(rois)
-        self.box_coder.decode(box_regression, proposals)
         pred_transforms = self.box_predictor(features)
         pred_logits = self.cls_predictor(features)
 
         loss = {}
+        output = []
         if self.training:
-            matched_boxes, gt_labels = self.assign_targets_to_proposals(proposals, gt_boxes, gt_classes)
-            gt_transforms = boxes_to_anchor_transforms(matched_boxes, proposals)
-            batched_pred_transforms, batched_pred_logits, batched_gt_transforms, batched_gt_labels =\
-                self._collate_fn(pred_transforms, pred_logits, gt_transforms, gt_labels)
-
             loss = self.compute_loss(
-                batched_pred_transforms, batched_pred_logits, batched_gt_transforms, batched_gt_labels
+                pred_transforms, pred_logits, gt_transforms, gt_labels
             )
+        else:
+            boxes, scores, labels = self._postprocess_predictions(pred_transforms, pred_logits, proposals)
 
-        return pred_transforms, pred_logits, loss
+            for i in range(len(boxes)):
+                output.append(
+                    {
+                        'boxes': boxes[i],
+                        'scores': scores[i],
+                        'labels': labels[i]
+                    }
+                )
+
+        return output, loss
 
     def compute_loss(
             self,
             pred_transforms: Tensor,
             pred_logits: Tensor,
-            gt_transforms: Tensor,
-            gt_labels: Tensor
+            gt_transforms: List[Tensor],
+            gt_labels: List[Tensor]
     ) -> Dict[str, Tensor]:
+
+        gt_transforms = torch.cat(gt_transforms, dim=0)
+        gt_labels = torch.cat(gt_labels, dim=0)
 
         cls_loss = self.cls_criterion(pred_logits, gt_labels)
 
-        pred_transforms = pred_transforms.reshape(self.fast_rcnn_batch_size, pred_transforms.shape[-1] // 4, 4)
+        num_boxes = pred_transforms.shape[0]
+        pred_transforms = pred_transforms.reshape(num_boxes, pred_transforms.shape[-1] // 4, 4)
         pos_idxs = torch.where(gt_labels > 0)[0]
         pos_labels = gt_labels[pos_idxs]
 
@@ -97,7 +129,7 @@ class FastRCNN(nn.Module):
 
         return {'loss': loss, 'box_loss': box_loss.detach(), 'cls_loss': cls_loss.detach()}
 
-    def assign_targets_to_proposals(
+    def _assign_targets_to_proposals(
             self,
             proposals: List[Tensor],
             gt_boxes: List[Tensor],
@@ -130,37 +162,88 @@ class FastRCNN(nn.Module):
 
         return matched_boxes, labels
 
-    def _collate_fn(self, pred_transforms, pred_logits, gt_transforms, gt_labels):
-        batch_size = pred_transforms.shape[0]
+    def _collate_fn(
+            self,
+            proposals: List[Tensor],
+            gt_transforms: List[Tensor],
+            gt_labels: List[Tensor]
+    ) -> Tuple[List[Tensor], List[Tensor], List[Tensor]]:
 
-        batched_pred_transforms = torch.empty((batch_size, self.fast_rcnn_batch_size, 4))
-        batched_pred_logits = torch.empty((batch_size, self.fast_rcnn_batch_size))
-        batched_gt_transforms = torch.empty((batch_size, self.fast_rcnn_batch_size, 4))
-        batched_gt_labels = torch.empty((batch_size, self.fast_rcnn_batch_size))
+        batch_size = len(proposals)
+
+        batched_proposals = []
+        batched_gt_transforms = []
+        batched_gt_labels = []
 
         for i in range(batch_size):
-            pred_transforms_i, pred_logits_i = pred_transforms[i], pred_logits[i]
+            proposals_i = proposals[i]
             gt_transforms_i, gt_labels_i = gt_transforms[i], gt_labels[i]
 
             pos_idxs, neg_idxs = self.batch_sampler(gt_labels_i)
 
-            batched_pred_transforms[i] = torch.cat([
-                pred_transforms_i[pos_idxs], pred_transforms_i[neg_idxs]
-            ], dim=0)
+            batched_proposals.append(
+                torch.cat([proposals_i[pos_idxs], proposals_i[neg_idxs]], dim=0)
+            )
 
-            batched_gt_transforms[i] = torch.cat([
-                gt_transforms_i[pos_idxs], gt_transforms_i[neg_idxs]
-            ], dim=0)
+            batched_gt_transforms.append(
+                torch.cat([gt_transforms_i[pos_idxs], gt_transforms_i[neg_idxs]], dim=0)
+            )
 
-            batched_pred_logits[i] = torch.cat([
-                pred_logits_i[pos_idxs], pred_logits_i[neg_idxs]
-            ], dim=0)
+            batched_gt_labels.append(
+                torch.cat([gt_labels_i[pos_idxs], gt_labels_i[neg_idxs]], dim=0)
+            )
 
-            batched_gt_labels[i] = torch.cat([
-                gt_labels_i[pos_idxs], gt_labels_i[neg_idxs]
-            ], dim=0)
+        return batched_proposals, batched_gt_transforms, batched_gt_labels
 
-        return batched_pred_transforms, batched_pred_logits, batched_gt_transforms, batched_gt_labels
+    def _postprocess_predictions(
+            self,
+            pred_transforms: Tensor,
+            pred_logits: Tensor,
+            proposals: List[Tensor]
+    ) -> Tuple[List[Tensor], List[Tensor], List[Tensor]]:
 
-    def filter_predictions(self, pred_transforms, pred_logits, proposals):
-        pred_scores = torch.softmax(pred_logits, dim=-1)
+        boxes_per_image = [boxes_in_image.shape[0] for boxes_in_image in proposals]
+
+        pred_boxes = transforms_to_boxes(pred_transforms, proposals)
+        pred_scores = F.softmax(pred_logits, dim=-1)
+
+        pred_boxes_list = torch.split(pred_boxes, boxes_per_image)
+        pred_scores_list = torch.split(pred_scores, boxes_per_image)
+
+        all_boxes = []
+        all_scores = []
+        all_labels = []
+        for boxes, scores in zip(pred_boxes_list, pred_scores_list):
+            boxes = clip_boxes_to_image(boxes, self.image_size)
+
+            labels = torch.arange(self.num_classes, device=pred_transforms.device)
+            labels = labels.view(1, -1).expand_as(pred_scores)
+
+            boxes, scores, labels = boxes[:, 1:], scores[:, 1:], labels[:, 1:]
+
+            boxes = boxes.reshape(-1, 4)
+            scores = scores.reshape(-1)
+            labels = labels.reshape(-1)
+
+            keep = torch.where(scores > self.inference_score_thresh)[0]
+            boxes, scores, labels = boxes[keep], scores[keep], labels[keep]
+
+            keep = remove_small_boxes(boxes, min_size=1e-2)
+            boxes, scores, labels = boxes[keep], scores[keep], labels[keep]
+
+            keep = batched_nms(boxes, scores, labels, self.inference_nms_thresh)
+            keep = keep[:self.detections_per_img]
+            boxes, scores, labels = boxes[keep], scores[keep], labels[keep]
+
+            all_boxes.append(boxes)
+            all_scores.append(scores)
+            all_labels.append(labels)
+
+        return all_boxes, all_scores, all_labels
+
+    def _post_nms_top_n(self) -> int:
+        if self.training:
+            return self.post_nms_top_n['training']
+        return self.post_nms_top_n['testing']
+
+
