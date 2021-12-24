@@ -109,9 +109,6 @@ class ProposalMathcer:
         matches[between_thresholds] = self.DISCARD_CONST
         # matches[cross_boundary] = self.DISCARD_CONST
 
-
-
-
         return matches
 
 

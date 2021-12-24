@@ -1,9 +1,9 @@
-from typing import Tuple, List, Dict
+from typing import Optional, Tuple, List, Dict
 
 import torch
 from torch import nn
 import torch.nn.functional as F
-from torchvision.ops import RoIPool, box_iou, batched_nms, clip_boxes_to_image, remove_small_boxes
+from torchvision.ops import RoIPool, box_iou, batched_nms, clip_boxes_to_image, remove_small_boxes, RoIAlign
 
 from utils.utils import ProposalMathcer, BalancedBatchSampler, boxes_to_transforms, transforms_to_boxes
 
@@ -14,6 +14,7 @@ Tensor = torch.Tensor
 class FastRCNN(nn.Module):
     def __init__(
             self,
+            mask_branch: bool,
             roi_output_size: int or Tuple[int, int],
             roi_spatial_scale: float,
             backbone_out_channels: int,
@@ -29,6 +30,8 @@ class FastRCNN(nn.Module):
             detections_per_img: int
     ):
         super(FastRCNN, self).__init__()
+
+        self.mask_branch = mask_branch
 
         self.image_size = image_size
         self.num_classes = num_classes
@@ -62,12 +65,37 @@ class FastRCNN(nn.Module):
         self.box_criterion = nn.SmoothL1Loss(reduction='sum')
         self.cls_criterion = nn.CrossEntropyLoss(reduction='mean')
 
+        if self.mask_branch:
+            self.mask_roi_pool = RoIAlign(
+                output_size=14,
+                spatial_scale=roi_spatial_scale * 2,
+                sampling_ratio=2)
+
+            head_layers = []
+            in_features = backbone_out_channels
+            for _ in range(4):
+                head_layers.append(
+                    nn.Conv2d(in_features, 256, kernel_size=(3, 3), stride=(1, 1), padding=1)
+                )
+                head_layers.append(
+                    nn.ReLU()
+                )
+                in_features = 256
+            self.mask_head = nn.Sequential(*head_layers)
+
+            self.mask_predictor = nn.Sequential(
+                nn.ConvTranspose2d(256, 256, kernel_size=(2, 2), stride=(2, 2)),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(256, num_classes, kernel_size=(1, 1), stride=(1, 1))
+            )
+
     def forward(
             self,
             backbone_features: Tensor,
             proposals: List[Tensor],
-            gt_boxes: List[Tensor],
-            gt_classes: List[Tensor]
+            gt_boxes: Optional[List[Tensor]] = None,
+            gt_classes: Optional[List[Tensor]] = None,
+            gt_masks: Optional[List[Tensor]] = None
     ) -> Tuple[List[Dict[str, Tensor]], Dict[str, Tensor]]:
 
         if self.training:
@@ -78,7 +106,7 @@ class FastRCNN(nn.Module):
                 self._collate_fn(proposals, gt_transforms, gt_labels)
 
         else:
-            gt_labels, gt_transforms = None, None
+            matched_gt_boxes, gt_labels, gt_transforms = None, None, None
 
         rois = self.roi(backbone_features, proposals)  # [K, C, h, w]
         features = self.mlp(rois)
@@ -102,6 +130,33 @@ class FastRCNN(nn.Module):
                         'labels': labels[i]
                     }
                 )
+
+        if self.mask_branch:
+            if self.training:
+                num_images = len(proposals)
+                mask_proposals = []
+                pos_matched_gt_boxes = []
+                for img_id in range(num_images):
+                    pos = torch.where(gt_labels[img_id] > 0)[0]
+                    mask_proposals.append(proposals[img_id][pos])
+                    pos_matched_gt_boxes.append(matched_gt_boxes[img_id][pos])
+            else:
+                mask_proposals = [o['boxes'] for o in output]
+                pos_matched_idxs = None
+
+            mask_features = self.mask_roi_pool(backbone_features, mask_proposals)
+            mask_features = self.mask_head(mask_features)
+            mask_logits = self.mask_predictor(mask_features)
+
+            if self.training:
+                loss_mask = self.compute_mask_loss()
+                loss['loss'] += loss_mask['loss_mask']
+                loss['loss_mask'] = loss_mask['loss_mask'].detach()
+            else:
+                labels = [o['labels'] for o in output]
+                masks_probs = self._postprocess_masks(mask_logits, labels)
+                for mask_prob, o in zip(masks_probs, output):
+                    o['masks'] = mask_prob
 
         return output, loss
 
@@ -128,6 +183,9 @@ class FastRCNN(nn.Module):
         loss = box_loss + cls_loss
 
         return {'loss': loss, 'box_loss': box_loss.detach(), 'cls_loss': cls_loss.detach()}
+
+    def compute_mask_loss(self):
+        return {'loss_mask': torch.tensor(0)}
 
     def _assign_targets_to_proposals(
             self,
@@ -245,5 +303,18 @@ class FastRCNN(nn.Module):
         if self.training:
             return self.post_nms_top_n['training']
         return self.post_nms_top_n['testing']
+
+    @staticmethod
+    def _postprocess_masks(x: Tensor, labels: List[Tensor]) -> List[Tensor]:
+        mask_prob = x.sigmoid()
+
+        num_masks = x.shape[0]
+        boxes_per_image = [label.shape[0] for label in labels]
+        labels = torch.cat(labels)
+        index = torch.arange(num_masks, device=labels.device)
+        mask_prob = mask_prob[index, labels][:, None]
+        mask_prob = mask_prob.split(boxes_per_image, dim=0)
+
+        return mask_prob
 
 

@@ -60,6 +60,7 @@ class FasterRCNN(nn.Module):
         )
 
         self.fast_rcnn = FastRCNN(
+            mask_branch=True,
             roi_output_size=roi_output_size,
             roi_spatial_scale=roi_spatial_scale,
             backbone_out_channels=backbone_out_channels,
@@ -76,7 +77,7 @@ class FasterRCNN(nn.Module):
         )
 
     def forward(self, images, gt_boxes=None, gt_classes=None):
-        backbone_features = self.backbone(images)['features']
+        backbone_features = self.backbone(images)['0']
         proposals, rpn_loss = self.rpn(backbone_features, gt_boxes)
 
         fast_rcnn_output, fast_rcnn_loss = self.fast_rcnn(backbone_features, proposals, gt_boxes, gt_classes)
