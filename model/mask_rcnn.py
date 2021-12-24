@@ -10,7 +10,7 @@ from .fast_rcnn import FastRCNN
 Tensor = torch.Tensor
 
 
-class FasterRCNN(nn.Module):
+class MaskRCNN(nn.Module):
     def __init__(
             self,
             backbone: nn.Module,
@@ -39,7 +39,7 @@ class FasterRCNN(nn.Module):
             fast_nms_iou_pos_threshold: float,
             fast_nms_iou_neg_threshold: float
     ):
-        super(FasterRCNN, self).__init__()
+        super(MaskRCNN, self).__init__()
 
         self.backbone = backbone
         anchor_generator = AnchorGenerator(
