@@ -3,7 +3,7 @@ from typing import Optional, Tuple, List, Dict
 import torch
 from torch import nn
 import torch.nn.functional as F
-from torchvision.ops import RoIPool, box_iou, batched_nms, clip_boxes_to_image, remove_small_boxes, RoIAlign
+from torchvision.ops import RoIPool, box_iou, batched_nms, clip_boxes_to_image, remove_small_boxes, RoIAlign, roi_align
 
 from utils.utils import ProposalMathcer, BalancedBatchSampler, boxes_to_transforms, transforms_to_boxes
 
@@ -149,7 +149,7 @@ class FastRCNN(nn.Module):
             mask_logits = self.mask_predictor(mask_features)
 
             if self.training:
-                loss_mask = self.compute_mask_loss()
+                loss_mask = self.compute_mask_loss(proposals, mask_logits, pos_matched_gt_boxes, gt_masks, gt_labels)
                 loss['loss'] += loss_mask['loss_mask']
                 loss['loss_mask'] = loss_mask['loss_mask'].detach()
             else:
@@ -184,8 +184,27 @@ class FastRCNN(nn.Module):
 
         return {'loss': loss, 'box_loss': box_loss.detach(), 'cls_loss': cls_loss.detach()}
 
-    def compute_mask_loss(self):
-        return {'loss_mask': torch.tensor(0)}
+    def compute_mask_loss(self, proposals, mask_logits, mask_matched_idxs, gt_masks, gt_labels):
+        discretization_size = mask_logits.shape[-1]
+        labels = [gt_label[idxs] for gt_label, idxs in zip(gt_labels, mask_matched_idxs)]
+        mask_targets = []
+        for m, p, i in zip(gt_masks, proposals, mask_matched_idxs):
+            i = i.to(p)
+            rois = torch.cat([i[:, None], p], dim=1)
+            m = m[:, None].to(rois)
+            return roi_align(m, rois, (discretization_size, discretization_size), 1.)[:, 0]
+
+
+        labels = torch.cat(labels, dim=0)
+        mask_targets = torch.cat(mask_targets, dim=0)
+
+        if mask_targets.numel() == 0:
+            return mask_logits.sum() * 0
+
+        loss = F.binary_cross_entropy_with_logits(
+            mask_logits[torch.arange(labels.shape[0], device=labels.device), labels], mask_targets
+        )
+        return {'loss_mask': loss}
 
     def _assign_targets_to_proposals(
             self,
